@@ -39,12 +39,15 @@ async def async_setup_entry(
         port=entry.data[CONF_PORT],
     )
 
-    # Force Extended I/O so source numbering is consistent across models.
-    if entry.data.get(CONF_EXTENDED_IO, DEFAULT_EXTENDED_IO):
-        try:
-            await client.async_enable_extended_io()
-        except PulseEightError as err:
-            _LOGGER.warning("Could not enable Extended I/O mode: %s", err)
+    # Normalise control flags (ACK/ECO on, ASY off) and, by default, Extended
+    # I/O so source numbering is consistent across models. Fire-and-forget, so
+    # this won't fail setup on its own.
+    try:
+        await client.async_configure(
+            extended_io=entry.data.get(CONF_EXTENDED_IO, DEFAULT_EXTENDED_IO)
+        )
+    except PulseEightError as err:
+        _LOGGER.warning("Could not apply Pulse-Eight control settings: %s", err)
 
     counts = MODELS.get(entry.data.get(CONF_MODEL, DEFAULT_MODEL), MODELS[DEFAULT_MODEL])
     coordinator = PulseEightCoordinator(
@@ -54,7 +57,14 @@ async def async_setup_entry(
         outputs=counts["zones"],
         sources=build_sources(counts),
     )
-    await coordinator.async_config_entry_first_refresh()
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception:
+        # Don't leak the socket on a failed/ retried setup: this switch keeps a
+        # TCP connection open for up to 10 minutes, and a leaked one can starve
+        # subsequent connection attempts.
+        await client.async_close()
+        raise
 
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

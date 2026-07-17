@@ -21,9 +21,21 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from .const import DEFAULT_TIMEOUT, XS_EXTENDED_IO_FLAG
+from .const import (
+    DEFAULT_TIMEOUT,
+    XS_ACK_FLAG,
+    XS_ASY_FLAG,
+    XS_ECO_FLAG,
+    XS_EXTENDED_IO_FLAG,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+# Once the first reply byte arrives, remaining frames of a multi-frame response
+# come fast (the protocol guide promises <100ms). If nothing more arrives within
+# this gap, the response is complete. Kept independent of the connect timeout so
+# ACK-disabled units don't stall a full timeout per command.
+_INTER_FRAME_TIMEOUT: float = 0.5
 
 # Error-code table from the protocol guide ("The Error Response").
 _ERROR_TEXT: dict[int, str] = {
@@ -127,27 +139,49 @@ class PulseEightClient:
 
     # --- Low-level command exchange ---------------------------------------
 
-    async def _command(self, verb: str, body: str = "", expected: int = 1) -> list[str]:
+    async def _command(
+        self,
+        verb: str,
+        body: str = "",
+        expected: int = 1,
+        require_response: bool = True,
+    ) -> list[str]:
         """Send ``^<verb> <body>$`` and return the params of matching ``^=`` frames.
 
-        With ACK+ECO on (the factory default) the switch replies ``^+$`` then one
-        ``^=<verb> ...$`` echo per affected zone. ``expected`` is how many echo
-        frames to wait for (1 for a set/version, ``outputs`` for a batch query);
-        we return as soon as the ack and that many frames arrive so a command
-        costs ~one round trip, not a full timeout window. A ``^!<n>$`` frame
-        raises :class:`PulseEightCommandError`; other async frames are skipped.
+        Response handling does NOT depend on the ``^+$`` ack (units can have ACK
+        disabled). We read the first frame within the connect timeout, then keep
+        reading with a short inter-frame gap, returning once ``expected`` data
+        frames arrive or the gap elapses. ``expected`` is how many ``^=<verb>``
+        frames to wait for (1 for a set/version, ``outputs`` for a batch query).
+
+        A ``^!<n>$`` frame raises :class:`PulseEightCommandError`; other frames
+        (acks, async/echo frames for other commands) are skipped. With
+        ``require_response=False`` the command is fire-and-forget: any replies
+        are drained but total silence is not an error (used for XS config, which
+        may not reply until ACK/ECO are enabled).
         """
+        sent = f"^{verb} {body}$" if body else f"^{verb}$"
         async with self._lock:
             try:
-                return await self._command_locked(verb, body, expected)
-            except (OSError, asyncio.TimeoutError) as err:
+                return await self._command_locked(
+                    verb, body, expected, require_response
+                )
+            except asyncio.TimeoutError as err:
                 await self._disconnect()
                 raise PulseEightConnectionError(
-                    f"Communication error with {self._host}: {err}"
+                    f"No response from {self._host}:{self._port} to {sent!r} "
+                    f"within {self._timeout}s (connected, but the switch sent "
+                    f"nothing back)"
+                ) from err
+            except OSError as err:
+                await self._disconnect()
+                raise PulseEightConnectionError(
+                    f"Communication error with {self._host}:{self._port} on "
+                    f"{sent!r}: {err!r}"
                 ) from err
 
     async def _command_locked(
-        self, verb: str, body: str, expected: int
+        self, verb: str, body: str, expected: int, require_response: bool
     ) -> list[str]:
         await self._ensure_connected()
         assert self._writer is not None and self._reader is not None
@@ -159,31 +193,40 @@ class PulseEightClient:
 
         prefix = f"={verb} "
         results: list[str] = []
-        acked = False
-        while not (acked and len(results) >= expected):
+        first = True
+        while expected <= 0 or len(results) < expected:
+            # Full timeout only while awaiting the first frame of a command we
+            # require a reply to (detects a dead link); a short gap otherwise, so
+            # an ACK-off unit that sends only its data frame — or a fire-and-
+            # forget command that sends nothing — returns promptly.
+            timeout = (
+                self._timeout
+                if first and require_response
+                else _INTER_FRAME_TIMEOUT
+            )
             try:
                 frame = await asyncio.wait_for(
-                    self._read_frame(), timeout=self._timeout
+                    self._read_frame(), timeout=timeout
                 )
             except asyncio.TimeoutError:
-                # A zone may not answer (e.g. it doesn't exist); return whatever
-                # arrived rather than hanging, but surface a total silence.
-                _LOGGER.debug(
-                    "RX timeout for ^%s$ (acked=%s, %d/%d frames)",
-                    verb, acked, len(results), expected,
-                )
-                if acked or results:
-                    break
-                raise
+                if first and require_response:
+                    _LOGGER.debug("RX timeout (no response) for %s", command)
+                    raise
+                # Fire-and-forget, or no more frames coming: we're done.
+                break
+            first = False
             _LOGGER.debug("RX ^%s$", frame)
-            if frame == "+":
-                acked = True
-            elif frame.startswith("!"):
-                raise PulseEightCommandError(int(frame[1:] or 0))
-            elif frame.startswith(prefix):
-                results.append(frame[len(prefix):])
-            # else: unrelated async/echo frame for another command; ignore.
+            self._collect_frame(frame, prefix, results)
         return results
+
+    @staticmethod
+    def _collect_frame(frame: str, prefix: str, results: list[str]) -> None:
+        """Classify one frame: append data, raise on error, skip the rest."""
+        if frame.startswith("!"):
+            raise PulseEightCommandError(int(frame[1:] or 0))
+        if frame.startswith(prefix):
+            results.append(frame[len(prefix):])
+        # "+" acks and async/echo frames for other commands are ignored.
 
     async def _read_frame(self) -> str:
         """Read and return the text inside the next ``^...$`` frame."""
@@ -220,10 +263,20 @@ class PulseEightClient:
         """Validate connectivity during config flow."""
         return await self.async_get_version()
 
-    async def async_enable_extended_io(self) -> None:
-        """Set the XIO flag so source numbering is model-independent."""
-        # '+' prefix sets just this bit without disturbing the others.
-        await self._command("XS", f"+{XS_EXTENDED_IO_FLAG}")
+    async def async_configure(self, extended_io: bool = True) -> None:
+        """Normalise the XS control flags for predictable behaviour.
+
+        Turns ACK and ECO on (so replies are deterministic) and ASY off (no
+        unsolicited frames to desync the reader), and optionally sets XIO for
+        model-independent source numbering. Fire-and-forget: these run before we
+        know the current ACK state, so a missing reply is not an error.
+        """
+        set_bits = XS_ACK_FLAG | XS_ECO_FLAG
+        if extended_io:
+            set_bits |= XS_EXTENDED_IO_FLAG
+        # '+' sets the listed bits, '-' clears them, without touching the rest.
+        await self._command("XS", f"+{set_bits}", require_response=False)
+        await self._command("XS", f"-{XS_ASY_FLAG}", require_response=False)
 
     async def async_get_state(self, outputs: int) -> MatrixState:
         """Poll routing, mute and volume for zones 1..outputs."""

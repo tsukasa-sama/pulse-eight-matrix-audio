@@ -37,6 +37,10 @@ KIND_LABEL: Final[dict[str, str]] = {
 #   33-64 = coax PCM/Dolby/DTS (base 32)
 #   65-80 = optical           (base 64, only 16 slots)
 XS_EXTENDED_IO_FLAG: Final = 32768
+# Other XS control bits we normalise at setup for deterministic replies:
+XS_ASY_FLAG: Final = 1  # async unsolicited responses (we turn OFF)
+XS_ACK_FLAG: Final = 2  # "^+$" acknowledgements (we turn ON)
+XS_ECO_FLAG: Final = 4  # echo "^=...$" on set commands (we turn ON)
 SOURCE_DISCONNECT: Final = 0
 SOURCE_BASE: Final[dict[str, int]] = {
     KIND_ANALOG: 0,
