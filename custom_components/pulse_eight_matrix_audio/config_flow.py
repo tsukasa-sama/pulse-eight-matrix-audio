@@ -58,10 +58,20 @@ class PulseEightConfigFlow(ConfigFlow, domain=DOMAIN):
             )
             try:
                 info = await client.async_test_connection()
-            except PulseEightError:
+            except PulseEightError as err:
+                _LOGGER.warning(
+                    "Connection to Pulse-Eight matrix at %s:%s failed: %s",
+                    user_input[CONF_HOST],
+                    user_input[CONF_PORT],
+                    err,
+                )
                 errors["base"] = "cannot_connect"
             except Exception:  # noqa: BLE001
-                _LOGGER.exception("Unexpected error validating connection")
+                _LOGGER.exception(
+                    "Unexpected error validating Pulse-Eight matrix at %s:%s",
+                    user_input[CONF_HOST],
+                    user_input[CONF_PORT],
+                )
                 errors["base"] = "unknown"
             else:
                 # Prefer the serial number for a stable unique id; fall back to

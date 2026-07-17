@@ -94,6 +94,7 @@ class PulseEightClient:
     async def _ensure_connected(self) -> None:
         if self._writer is not None and not self._writer.is_closing():
             return
+        _LOGGER.debug("Connecting to %s:%s", self._host, self._port)
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self._host, self._port),
@@ -101,9 +102,13 @@ class PulseEightClient:
             )
             self._buffer.clear()
         except (OSError, asyncio.TimeoutError) as err:
+            _LOGGER.debug(
+                "Connection to %s:%s failed: %r", self._host, self._port, err
+            )
             raise PulseEightConnectionError(
                 f"Cannot connect to {self._host}:{self._port}: {err}"
             ) from err
+        _LOGGER.debug("Connected to %s:%s", self._host, self._port)
 
     async def async_close(self) -> None:
         """Close the connection (call on unload)."""
@@ -148,6 +153,7 @@ class PulseEightClient:
         assert self._writer is not None and self._reader is not None
 
         command = f"^{verb} {body}$" if body else f"^{verb}$"
+        _LOGGER.debug("TX %s", command)
         self._writer.write(command.encode("ascii"))
         await self._writer.drain()
 
@@ -162,9 +168,14 @@ class PulseEightClient:
             except asyncio.TimeoutError:
                 # A zone may not answer (e.g. it doesn't exist); return whatever
                 # arrived rather than hanging, but surface a total silence.
+                _LOGGER.debug(
+                    "RX timeout for ^%s$ (acked=%s, %d/%d frames)",
+                    verb, acked, len(results), expected,
+                )
                 if acked or results:
                     break
                 raise
+            _LOGGER.debug("RX ^%s$", frame)
             if frame == "+":
                 acked = True
             elif frame.startswith("!"):
