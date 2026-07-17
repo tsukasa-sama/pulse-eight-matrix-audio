@@ -74,6 +74,10 @@ class PulseEightConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
                 errors["base"] = "unknown"
             else:
+                _LOGGER.debug(
+                    "Probe of %s:%s ok: %s",
+                    user_input[CONF_HOST], user_input[CONF_PORT], info,
+                )
                 # Prefer the serial number for a stable unique id; fall back to
                 # host:port if the switch didn't report one.
                 unique_id = info.serial or (

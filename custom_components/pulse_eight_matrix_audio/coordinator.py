@@ -68,6 +68,14 @@ class PulseEightCoordinator(DataUpdateCoordinator[MatrixState]):
         try:
             if self.device_info is None:
                 self.device_info = await self.client.async_get_version()
-            return await self.client.async_get_state(self.outputs)
+                _LOGGER.debug("Version: %s", self.device_info)
+            _LOGGER.debug("Polling %d zones", self.outputs)
+            state = await self.client.async_get_state(self.outputs)
         except PulseEightError as err:
+            _LOGGER.debug("Poll failed: %s", err)
             raise UpdateFailed(str(err)) from err
+        _LOGGER.debug(
+            "Poll ok: routes=%s mutes=%s volumes=%s",
+            state.routes, state.mutes, state.volumes,
+        )
+        return state

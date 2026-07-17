@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
@@ -9,8 +10,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import PulseEightConfigEntry
-from .client import PulseEightError
 from .entity import PulseEightEntity
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -52,9 +54,6 @@ class PulseEightMuteSwitch(PulseEightEntity, SwitchEntity):
         await self._async_set_mute(False)
 
     async def _async_set_mute(self, muted: bool) -> None:
-        try:
-            await self.coordinator.client.async_set_mute(self._output, muted)
-        except PulseEightError:
-            # Let the next poll reconcile; re-raise for HA to surface.
-            raise
+        _LOGGER.debug("switch: zone %d mute -> %s", self._output, muted)
+        await self.coordinator.client.async_set_mute(self._output, muted)
         await self.coordinator.async_request_refresh()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from homeassistant.components.select import SelectEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -9,6 +11,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import PulseEightConfigEntry
 from .coordinator import PulseEightCoordinator
 from .entity import PulseEightEntity
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -48,7 +52,15 @@ class PulseEightRouteSelect(PulseEightEntity, SelectEntity):
     async def async_select_option(self, option: str) -> None:
         """Route the chosen input to this output."""
         number = self.coordinator.number_for_name(option)
+        _LOGGER.debug(
+            "select output %d -> %r (source number %s)",
+            self._output, option, number,
+        )
         if number is None:
+            _LOGGER.warning(
+                "Output %d: no source matches %r; options are %s",
+                self._output, option, self._attr_options,
+            )
             return
         await self.coordinator.client.async_set_route(self._output, number)
         await self.coordinator.async_request_refresh()

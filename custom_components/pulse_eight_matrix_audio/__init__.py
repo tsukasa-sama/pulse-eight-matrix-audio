@@ -34,28 +34,34 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: PulseEightConfigEntry
 ) -> bool:
     """Set up Pulse-Eight Matrix Audio from a config entry."""
-    client = PulseEightClient(
-        host=entry.data[CONF_HOST],
-        port=entry.data[CONF_PORT],
+    host = entry.data[CONF_HOST]
+    port = entry.data[CONF_PORT]
+    model = entry.data.get(CONF_MODEL, DEFAULT_MODEL)
+    extended_io = entry.data.get(CONF_EXTENDED_IO, DEFAULT_EXTENDED_IO)
+    counts = MODELS.get(model, MODELS[DEFAULT_MODEL])
+    sources = build_sources(counts)
+
+    _LOGGER.info(
+        "Setting up %s at %s:%s (%d zones, %d sources, extended_io=%s)",
+        model, host, port, counts["zones"], len(sources), extended_io,
     )
+
+    client = PulseEightClient(host=host, port=port)
 
     # Normalise control flags (ACK/ECO on, ASY off) and, by default, Extended
     # I/O so source numbering is consistent across models. Fire-and-forget, so
     # this won't fail setup on its own.
     try:
-        await client.async_configure(
-            extended_io=entry.data.get(CONF_EXTENDED_IO, DEFAULT_EXTENDED_IO)
-        )
+        await client.async_configure(extended_io=extended_io)
     except PulseEightError as err:
         _LOGGER.warning("Could not apply Pulse-Eight control settings: %s", err)
 
-    counts = MODELS.get(entry.data.get(CONF_MODEL, DEFAULT_MODEL), MODELS[DEFAULT_MODEL])
     coordinator = PulseEightCoordinator(
         hass,
         entry,
         client,
         outputs=counts["zones"],
-        sources=build_sources(counts),
+        sources=sources,
     )
     try:
         await coordinator.async_config_entry_first_refresh()
@@ -63,12 +69,21 @@ async def async_setup_entry(
         # Don't leak the socket on a failed/ retried setup: this switch keeps a
         # TCP connection open for up to 10 minutes, and a leaked one can starve
         # subsequent connection attempts.
+        _LOGGER.debug("First refresh failed for %s; closing client", host)
         await client.async_close()
         raise
+
+    info = coordinator.device_info
+    if info:
+        _LOGGER.info(
+            "Connected to %s (reported model %r, firmware %s, serial %s)",
+            host, info.model, info.firmware, info.serial,
+        )
 
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+    _LOGGER.debug("Setup complete for %s", host)
     return True
 
 
@@ -83,6 +98,7 @@ async def async_unload_entry(
     hass: HomeAssistant, entry: PulseEightConfigEntry
 ) -> bool:
     """Unload a config entry."""
+    _LOGGER.debug("Unloading %s", entry.data.get(CONF_HOST))
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         await entry.runtime_data.client.async_close()

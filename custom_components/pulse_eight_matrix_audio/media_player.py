@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from homeassistant.components.media_player import (
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
@@ -14,6 +16,8 @@ from . import PulseEightConfigEntry
 from .const import VOLUME_MAX
 from .coordinator import PulseEightCoordinator
 from .entity import PulseEightEntity
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -73,19 +77,28 @@ class PulseEightZone(PulseEightEntity, MediaPlayerEntity):
     async def async_select_source(self, source: str) -> None:
         """Route an input to this zone."""
         number = self.coordinator.number_for_name(source)
+        _LOGGER.debug(
+            "zone %d select source %r (source number %s)",
+            self._output, source, number,
+        )
         if number is None:
+            _LOGGER.warning(
+                "Zone %d: no source matches %r; options are %s",
+                self._output, source, self._attr_source_list,
+            )
             return
         await self.coordinator.client.async_set_route(self._output, number)
         await self.coordinator.async_request_refresh()
 
     async def async_mute_volume(self, mute: bool) -> None:
         """Mute or unmute this zone."""
+        _LOGGER.debug("zone %d mute %s", self._output, mute)
         await self.coordinator.client.async_set_mute(self._output, mute)
         await self.coordinator.async_request_refresh()
 
     async def async_set_volume_level(self, volume: float) -> None:
         """Set zone volume from a 0..1 float."""
-        await self.coordinator.client.async_set_volume(
-            self._output, round(volume * VOLUME_MAX)
-        )
+        level = round(volume * VOLUME_MAX)
+        _LOGGER.debug("zone %d volume %.2f -> %d%%", self._output, volume, level)
+        await self.coordinator.client.async_set_volume(self._output, level)
         await self.coordinator.async_request_refresh()

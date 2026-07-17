@@ -55,3 +55,39 @@ Copy `custom_components/pulse_eight_matrix_audio/` into your Home Assistant
 **Settings → Devices & Services → Pulse-Eight Matrix Audio → Configure** opens a
 form listing every input; set a friendly name for any of them. Names update
 across all source selectors immediately.
+
+## Troubleshooting
+
+The integration logs its whole lifecycle. INFO-level breadcrumbs appear by
+default; enable DEBUG for the full protocol exchange.
+
+```yaml
+# configuration.yaml — then restart Home Assistant
+logger:
+  logs:
+    custom_components.pulse_eight_matrix_audio: debug
+```
+
+What you'll see (all under `custom_components.pulse_eight_matrix_audio.*`):
+
+| Logger | Level | Shows |
+|---|---|---|
+| `__init__` | INFO | Setup start (model, host, zones) and the version the switch reports |
+| `config_flow` | WARNING | Why a connection attempt during setup failed |
+| `coordinator` | DEBUG | Each poll and the routes/mutes/volumes returned |
+| `client` | DEBUG | `Connecting to …`, `TX ^…$` / `RX ^…$` (raw frames), `Set route/mute/volume …` |
+| `select` / `media_player` / `switch` | DEBUG | Each UI action, the target zone, and the resolved source number |
+
+Reading a failure:
+
+- **`Cannot connect to …`** — TCP connect failed/timed out. The switch services
+  only a few sockets and holds them open for up to 10 minutes; if a prior
+  connection is stuck, power-cycle the matrix to free it.
+- **`No response … the switch sent nothing back`** — connected, but the command
+  got no reply. Check the `TX`/`RX` lines to see how far it got.
+- **`Error N: …`** — the switch rejected a command (see the protocol guide's
+  error table).
+
+The connection model is **connect-per-command** (open → send → close), so the
+matrix never holds an idle Home Assistant socket and nothing leaks across
+restarts.

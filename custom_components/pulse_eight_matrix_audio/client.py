@@ -90,52 +90,23 @@ class MatrixState:
 
 
 class PulseEightClient:
-    """Persistent async TCP client for a single ProAudio matrix."""
+    """Connect-per-command async TCP client for a single ProAudio matrix.
+
+    The switch keeps a connection open until the client closes it or 10 minutes
+    elapse, and services only a small number of sockets. A persistent connection
+    would leak a socket on any HA restart/crash and block reconnection for up to
+    10 minutes, so instead we open a fresh connection per command and close it
+    immediately. Commands are serialised by a lock.
+    """
 
     def __init__(self, host: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> None:
         self._host = host
         self._port = port
         self._timeout = timeout
         self._lock = asyncio.Lock()
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
-        self._buffer = bytearray()
-
-    # --- Connection management --------------------------------------------
-
-    async def _ensure_connected(self) -> None:
-        if self._writer is not None and not self._writer.is_closing():
-            return
-        _LOGGER.debug("Connecting to %s:%s", self._host, self._port)
-        try:
-            self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(self._host, self._port),
-                timeout=self._timeout,
-            )
-            self._buffer.clear()
-        except (OSError, asyncio.TimeoutError) as err:
-            _LOGGER.debug(
-                "Connection to %s:%s failed: %r", self._host, self._port, err
-            )
-            raise PulseEightConnectionError(
-                f"Cannot connect to {self._host}:{self._port}: {err}"
-            ) from err
-        _LOGGER.debug("Connected to %s:%s", self._host, self._port)
 
     async def async_close(self) -> None:
-        """Close the connection (call on unload)."""
-        async with self._lock:
-            await self._disconnect()
-
-    async def _disconnect(self) -> None:
-        writer, self._writer, self._reader = self._writer, None, None
-        if writer is None:
-            return
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except OSError:
-            pass
+        """No-op: connections are per-command and never held open."""
 
     # --- Low-level command exchange ---------------------------------------
 
@@ -148,11 +119,12 @@ class PulseEightClient:
     ) -> list[str]:
         """Send ``^<verb> <body>$`` and return the params of matching ``^=`` frames.
 
-        Response handling does NOT depend on the ``^+$`` ack (units can have ACK
-        disabled). We read the first frame within the connect timeout, then keep
-        reading with a short inter-frame gap, returning once ``expected`` data
-        frames arrive or the gap elapses. ``expected`` is how many ``^=<verb>``
-        frames to wait for (1 for a set/version, ``outputs`` for a batch query).
+        Opens a connection, runs the exchange, and closes it. Response handling
+        does NOT depend on the ``^+$`` ack (units can have ACK disabled): we read
+        the first frame within the connect timeout, then keep reading with a
+        short inter-frame gap, returning once ``expected`` data frames arrive or
+        the gap elapses. ``expected`` is how many ``^=<verb>`` frames to wait for
+        (1 for a set/version, ``outputs`` for a batch query).
 
         A ``^!<n>$`` frame raises :class:`PulseEightCommandError`; other frames
         (acks, async/echo frames for other commands) are skipped. With
@@ -162,36 +134,54 @@ class PulseEightClient:
         """
         sent = f"^{verb} {body}$" if body else f"^{verb}$"
         async with self._lock:
+            _LOGGER.debug("Connecting to %s:%s", self._host, self._port)
             try:
-                return await self._command_locked(
-                    verb, body, expected, require_response
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(self._host, self._port),
+                    timeout=self._timeout,
+                )
+            except (OSError, asyncio.TimeoutError) as err:
+                raise PulseEightConnectionError(
+                    f"Cannot connect to {self._host}:{self._port}: {err!r}"
+                ) from err
+            try:
+                return await self._exchange(
+                    reader, writer, verb, body, expected, require_response
                 )
             except asyncio.TimeoutError as err:
-                await self._disconnect()
                 raise PulseEightConnectionError(
                     f"No response from {self._host}:{self._port} to {sent!r} "
                     f"within {self._timeout}s (connected, but the switch sent "
                     f"nothing back)"
                 ) from err
             except OSError as err:
-                await self._disconnect()
                 raise PulseEightConnectionError(
                     f"Communication error with {self._host}:{self._port} on "
                     f"{sent!r}: {err!r}"
                 ) from err
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except OSError:
+                    pass
 
-    async def _command_locked(
-        self, verb: str, body: str, expected: int, require_response: bool
+    async def _exchange(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        verb: str,
+        body: str,
+        expected: int,
+        require_response: bool,
     ) -> list[str]:
-        await self._ensure_connected()
-        assert self._writer is not None and self._reader is not None
-
         command = f"^{verb} {body}$" if body else f"^{verb}$"
         _LOGGER.debug("TX %s", command)
-        self._writer.write(command.encode("ascii"))
-        await self._writer.drain()
+        writer.write(command.encode("ascii"))
+        await writer.drain()
 
         prefix = f"={verb} "
+        buffer = bytearray()
         results: list[str] = []
         first = True
         while expected <= 0 or len(results) < expected:
@@ -206,7 +196,7 @@ class PulseEightClient:
             )
             try:
                 frame = await asyncio.wait_for(
-                    self._read_frame(), timeout=timeout
+                    self._read_frame(reader, buffer), timeout=timeout
                 )
             except asyncio.TimeoutError:
                 if first and require_response:
@@ -228,22 +218,22 @@ class PulseEightClient:
             results.append(frame[len(prefix):])
         # "+" acks and async/echo frames for other commands are ignored.
 
-    async def _read_frame(self) -> str:
+    @staticmethod
+    async def _read_frame(reader: asyncio.StreamReader, buffer: bytearray) -> str:
         """Read and return the text inside the next ``^...$`` frame."""
-        assert self._reader is not None
         while True:
-            match = _FRAME_RE.search(self._buffer)
+            match = _FRAME_RE.search(buffer)
             if match:
                 # Copy the captured bytes out BEFORE mutating the buffer: the
                 # match re-slices its (mutable) bytearray lazily, so deleting
                 # first would corrupt group(1).
                 frame = bytes(match.group(1))
-                del self._buffer[: match.end()]
+                del buffer[: match.end()]
                 return frame.decode("ascii", errors="replace").strip()
-            chunk = await self._reader.read(256)
+            chunk = await reader.read(256)
             if not chunk:
                 raise PulseEightConnectionError("Connection closed by switch")
-            self._buffer.extend(chunk)
+            buffer.extend(chunk)
 
     # --- High-level API ----------------------------------------------------
 
@@ -257,7 +247,9 @@ class PulseEightClient:
         model = parts[0].strip().strip('"') if parts else "ProAudio"
         firmware = parts[1].strip() if len(parts) > 1 else ""
         serial = parts[2].strip() if len(parts) > 2 else ""
-        return DeviceInfo(model=model, firmware=firmware, serial=serial)
+        info = DeviceInfo(model=model, firmware=firmware, serial=serial)
+        _LOGGER.debug("Parsed version: %s", info)
+        return info
 
     async def async_test_connection(self) -> DeviceInfo:
         """Validate connectivity during config flow."""
@@ -274,6 +266,10 @@ class PulseEightClient:
         set_bits = XS_ACK_FLAG | XS_ECO_FLAG
         if extended_io:
             set_bits |= XS_EXTENDED_IO_FLAG
+        _LOGGER.debug(
+            "Configuring XS: set +%d (ACK/ECO%s), clear -%d (ASY)",
+            set_bits, "/XIO" if extended_io else "", XS_ASY_FLAG,
+        )
         # '+' sets the listed bits, '-' clears them, without touching the rest.
         await self._command("XS", f"+{set_bits}", require_response=False)
         await self._command("XS", f"-{XS_ASY_FLAG}", require_response=False)
@@ -301,14 +297,17 @@ class PulseEightClient:
 
     async def async_set_route(self, output: int, source: int) -> None:
         """Route ``source`` to ``output`` (analog audio switch, 'SZ')."""
+        _LOGGER.debug("Set route: zone %d -> source %d", output, source)
         await self._command("SZ", f"@{output},{source}")
 
     async def async_set_mute(self, output: int, muted: bool) -> None:
         """Audio-mute or unmute an output ('VMZ')."""
+        _LOGGER.debug("Set mute: zone %d -> %s", output, muted)
         await self._command("VMZ", f"@{output},{1 if muted else 0}")
 
     async def async_set_volume(self, output: int, volume: int) -> None:
         """Set output volume as a 0-100 percentage ('VPZ')."""
+        _LOGGER.debug("Set volume: zone %d -> %d%%", output, volume)
         await self._command("VPZ", f"@{output},{volume}")
 
 
