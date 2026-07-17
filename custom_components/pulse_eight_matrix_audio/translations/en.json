@@ -1,0 +1,53 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Pulse-Eight Matrix Audio",
+        "description": "Enter the network address of your Pulse-Eight matrix.",
+        "data": {
+          "host": "Host / IP address",
+          "port": "Port",
+          "model": "Matrix model",
+          "extended_io": "Use Extended I/O mode"
+        },
+        "data_description": {
+          "port": "TCP control port (50005 on all ProAudio units)",
+          "model": "Selects the input and zone (output) counts for your unit.",
+          "extended_io": "Recommended. Makes input numbering consistent across ProAudio models."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the matrix.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This matrix is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Input names",
+        "description": "Assign friendly names to each input. Leave a field at its default to keep the generic label."
+      }
+    }
+  },
+  "entity": {
+    "switch": {
+      "output_mute": {
+        "name": "Output {output} mute"
+      }
+    },
+    "select": {
+      "output_route": {
+        "name": "Output {output} source"
+      }
+    },
+    "media_player": {
+      "zone": {
+        "name": "Zone {output}"
+      }
+    }
+  }
+}
