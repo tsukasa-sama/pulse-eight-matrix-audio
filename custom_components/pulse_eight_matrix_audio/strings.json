@@ -29,13 +29,7 @@
     "step": {
       "init": {
         "title": "Input names",
-        "description": "Assign friendly names to each input. Leave a field at its default to keep the generic label.",
-        "data": {
-          "shown_inputs": "Inputs to show"
-        },
-        "data_description": {
-          "shown_inputs": "Only checked inputs appear in each zone's source dropdown. Uncheck the ones you don't use to reduce clutter."
-        }
+        "description": "Assign a friendly name to each input, and use the \"Show …\" toggle beneath it to hide inputs you don't use from every zone's source list. Leave a name at its default to keep the generic label."
       }
     }
   },

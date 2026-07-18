@@ -14,7 +14,6 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import callback
-from homeassistant.helpers import config_validation as cv
 
 from .client import PulseEightClient, PulseEightError
 from .const import (
@@ -110,14 +109,19 @@ class PulseEightConfigFlow(ConfigFlow, domain=DOMAIN):
 class PulseEightOptionsFlow(OptionsFlow):
     """Let the user assign friendly names to each input."""
 
-    # Schema key for the "which inputs to show" toggle list. Distinct from the
-    # per-input name fields (which are keyed by each input's default label).
-    _SHOWN_FIELD = "shown_inputs"
+    # Prefix for each input's "show" toggle field, so it's distinct from that
+    # input's name field (keyed by the plain label, e.g. "RCA 1").
+    _SHOW_PREFIX = "Show "
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Name each input and choose which ones appear in the zone dropdown."""
+        """Name each input and toggle whether it appears in the zone dropdown.
+
+        Each input gets two adjacent fields: a name text box, then a "Show …"
+        toggle directly beneath it. Unchecking the toggle hides that input from
+        every zone's source list.
+        """
         counts = MODELS.get(
             self.config_entry.data.get(CONF_MODEL, DEFAULT_MODEL),
             MODELS[DEFAULT_MODEL],
@@ -129,52 +133,52 @@ class PulseEightOptionsFlow(OptionsFlow):
         disabled: set[str] = set(
             self.config_entry.options.get(CONF_DISABLED_SOURCES, [])
         )
-        # Name fields are keyed by the physical input label ("RCA 1"); map back
-        # to the storage key ("analog_1"). The toggle list is keyed by that same
-        # storage key so it survives renames.
+        # Fields are keyed by the physical input label ("RCA 1", or "Show RCA 1"
+        # for the toggle); map back to the storage key ("analog_1").
         by_label = {src.default_name: src for src in sources}
 
         if user_input is not None:
-            shown: list[str] = user_input.get(
-                self._SHOWN_FIELD, [s.key for s in sources]
-            )
-            names: dict[str, str] = {}
-            for label, value in user_input.items():
-                if label == self._SHOWN_FIELD:
-                    continue
-                src = by_label.get(label)
-                value = value.strip()
-                # Store only real overrides so default changes still propagate.
-                if src and value and value != src.default_name:
-                    names[src.key] = value
-            hidden = [s.key for s in sources if s.key not in shown]
+            names, hidden = self._parse_submission(user_input, by_label)
             return self.async_create_entry(
                 title="",
                 data={CONF_SOURCE_NAMES: names, CONF_DISABLED_SOURCES: hidden},
             )
 
-        # Toggle list: label each input by its current friendly name so it's
-        # recognisable; default to every input that isn't currently hidden.
-        shown_labels = {
-            src.key: current.get(src.key, src.default_name) for src in sources
-        }
-        shown_default = [s.key for s in sources if s.key not in disabled]
-        schema = vol.Schema(
-            {
-                **{
-                    vol.Optional(
-                        src.default_name,
-                        description={
-                            "suggested_value": current.get(
-                                src.key, src.default_name
-                            )
-                        },
-                    ): str
-                    for src in sources
-                },
+        # Build name box + show toggle per input, in order, so each toggle sits
+        # right under its name field. Toggle defaults on unless already hidden.
+        fields: dict[Any, Any] = {}
+        for src in sources:
+            fields[
                 vol.Optional(
-                    self._SHOWN_FIELD, default=shown_default
-                ): cv.multi_select(shown_labels),
-            }
-        )
-        return self.async_show_form(step_id="init", data_schema=schema)
+                    src.default_name,
+                    description={
+                        "suggested_value": current.get(src.key, src.default_name)
+                    },
+                )
+            ] = str
+            fields[
+                vol.Optional(
+                    f"{self._SHOW_PREFIX}{src.default_name}",
+                    default=src.key not in disabled,
+                )
+            ] = bool
+        return self.async_show_form(step_id="init", data_schema=vol.Schema(fields))
+
+    def _parse_submission(
+        self, user_input: dict[str, Any], by_label: dict[str, Any]
+    ) -> tuple[dict[str, str], list[str]]:
+        """Split submitted fields into name overrides and hidden-input keys."""
+        names: dict[str, str] = {}
+        hidden: list[str] = []
+        for key, value in user_input.items():
+            if key.startswith(self._SHOW_PREFIX):
+                src = by_label.get(key[len(self._SHOW_PREFIX):])
+                if src and not value:
+                    hidden.append(src.key)
+                continue
+            src = by_label.get(key)
+            value = value.strip()
+            # Store only real overrides so default changes still propagate.
+            if src and value and value != src.default_name:
+                names[src.key] = value
+        return names, hidden
