@@ -10,7 +10,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .client import DeviceInfo, MatrixState, PulseEightClient, PulseEightError
-from .const import CONF_SOURCE_NAMES, DOMAIN, SCAN_INTERVAL_SECONDS
+from .const import (
+    CONF_DISABLED_SOURCES,
+    CONF_SOURCE_NAMES,
+    DOMAIN,
+    SCAN_INTERVAL_SECONDS,
+)
 from .sources import Source
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,9 +53,14 @@ class PulseEightCoordinator(DataUpdateCoordinator[MatrixState]):
         names: dict[str, str] = self.entry.options.get(CONF_SOURCE_NAMES, {})
         return names.get(source.key) or source.default_name
 
+    def enabled_sources(self) -> list[Source]:
+        """Sources offered in the zone dropdown (hidden ones excluded)."""
+        disabled: set[str] = set(self.entry.options.get(CONF_DISABLED_SOURCES, []))
+        return [s for s in self.sources if s.key not in disabled]
+
     def source_names(self) -> list[str]:
-        """Ordered list of source labels for a select/source_list."""
-        return [self.source_name(s) for s in self.sources]
+        """Ordered labels for a source_list — only inputs the user left enabled."""
+        return [self.source_name(s) for s in self.enabled_sources()]
 
     def name_for_number(self, number: int) -> str | None:
         """Label for a routed source number, or None if unknown/disconnected."""

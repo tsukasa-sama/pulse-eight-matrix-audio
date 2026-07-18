@@ -104,9 +104,25 @@ class PulseEightClient:
         self._port = port
         self._timeout = timeout
         self._lock = asyncio.Lock()
+        # The socket of the command currently in flight, if any. Commands are
+        # serialised by the lock, so at most one exists at a time. Tracked so a
+        # teardown (async_close) can force it shut instead of leaving a half-open
+        # socket the switch will hold for up to 10 minutes.
+        self._writer: asyncio.StreamWriter | None = None
 
     async def async_close(self) -> None:
-        """No-op: connections are per-command and never held open."""
+        """Abort any in-flight command's socket so the switch frees it now.
+
+        Per-command connections normally close themselves. But if a command is
+        still running when the entry is torn down (e.g. a poll in flight during a
+        HACS reload), its socket would linger on the switch — which services only
+        a few sockets and holds them ~10 minutes — and starve the reconnect. An
+        immediate abort (RST) tells the switch the socket is gone right away.
+        """
+        writer = self._writer
+        if writer is not None:
+            self._writer = None
+            _abort_writer(writer)
 
     # --- Low-level command exchange ---------------------------------------
 
@@ -144,6 +160,7 @@ class PulseEightClient:
                 raise PulseEightConnectionError(
                     f"Cannot connect to {self._host}:{self._port}: {err!r}"
                 ) from err
+            self._writer = writer
             try:
                 return await self._exchange(
                     reader, writer, verb, body, expected, require_response
@@ -160,10 +177,15 @@ class PulseEightClient:
                     f"{sent!r}: {err!r}"
                 ) from err
             finally:
+                self._writer = None
                 writer.close()
+                # wait_closed() confirms the graceful FIN, but re-raises if we're
+                # here because the task was cancelled (reload/shutdown). Shield it
+                # so the close still completes; the close itself is already
+                # scheduled by writer.close() regardless.
                 try:
-                    await writer.wait_closed()
-                except OSError:
+                    await asyncio.shield(writer.wait_closed())
+                except (OSError, asyncio.CancelledError):
                     pass
 
     async def _exchange(
@@ -309,6 +331,24 @@ class PulseEightClient:
         """Set output volume as a 0-100 percentage ('VPZ')."""
         _LOGGER.debug("Set volume: zone %d -> %d%%", output, volume)
         await self._command("VPZ", f"@{output},{volume}")
+
+
+def _abort_writer(writer: asyncio.StreamWriter) -> None:
+    """Force a socket shut immediately (RST), tolerating a dead transport.
+
+    Used on teardown: ``transport.abort()`` skips the graceful FIN flush so the
+    switch sees the socket drop at once. Falls back to ``close()`` if abort is
+    unavailable, and swallows errors from an already-broken transport.
+    """
+    try:
+        transport = writer.transport
+        if transport is not None and hasattr(transport, "abort"):
+            transport.abort()
+        else:
+            writer.close()
+    except Exception:
+        # Best-effort teardown: an already-broken transport must never propagate.
+        pass
 
 
 def _parse_pair(raw: str) -> tuple[int | None, int]:

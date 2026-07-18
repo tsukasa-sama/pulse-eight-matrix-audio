@@ -17,6 +17,10 @@ CONF_MODEL: Final = "model"
 CONF_EXTENDED_IO: Final = "extended_io"
 # Options-flow key: {source key -> custom name}, e.g. {"analog_1": "Turntable"}.
 CONF_SOURCE_NAMES: Final = "source_names"
+# Options-flow key: list of source keys hidden from the zone source dropdown,
+# e.g. ["coax_3", "optical_1"]. A zone already routed to a hidden input still
+# shows that input's name; it's just no longer offered for selection.
+CONF_DISABLED_SOURCES: Final = "disabled_sources"
 
 # Input types and the ProAudio zones. Zones (outputs) drive entity creation,
 # so they must be right; per-type input counts drive the source selector.

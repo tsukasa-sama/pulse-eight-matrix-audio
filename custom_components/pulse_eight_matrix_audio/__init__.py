@@ -99,5 +99,12 @@ async def async_unload_entry(
     _LOGGER.debug("Unloading %s", entry.data.get(CONF_HOST))
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
-        await entry.runtime_data.client.async_close()
+        coordinator = entry.runtime_data
+        # Stop and await any in-flight poll BEFORE closing the client, so a
+        # reload (e.g. HACS update) can't leave a poll's socket open while the
+        # new setup starts connecting. The switch services only a few sockets and
+        # holds them ~10 minutes, so an overlapping stale socket starves the
+        # reconnect until the device is power-cycled.
+        await coordinator.async_shutdown()
+        await coordinator.client.async_close()
     return unloaded
