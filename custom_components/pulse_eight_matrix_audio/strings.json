@@ -34,16 +34,6 @@
     }
   },
   "entity": {
-    "switch": {
-      "output_mute": {
-        "name": "Output {output} mute"
-      }
-    },
-    "select": {
-      "output_route": {
-        "name": "Output {output} source"
-      }
-    },
     "media_player": {
       "zone": {
         "name": "Zone {output}"
