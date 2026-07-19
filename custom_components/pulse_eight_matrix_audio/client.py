@@ -10,13 +10,17 @@ Guide V2.1:
   * Query response params are fixed width, zero padded (zone/source = 3 digits).
 
 The socket is a raw TCP connection to port 50005 that the switch keeps open
-until closed or 10 minutes idle. We hold one persistent connection guarded by a
-lock and reconnect transparently on failure.
+until closed or 10 minutes idle. The switch services only a few sockets, so we
+open a fresh connection per exchange, serialise them with a lock, and force it
+shut with a TCP RST (abort) the moment we're done — a graceful FIN leaves the
+switch's command-oriented socket in CLOSE_WAIT, holding a pool slot until its
+10-minute idle timer and eventually starving new connections.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -50,6 +54,12 @@ _ERROR_TEXT: dict[int, str] = {
 
 # One ^...$ frame. CR/LF and stray bytes between frames are ignored.
 _FRAME_RE = re.compile(rb"\^([^$]*)\$")
+
+# A query/echo frame body: "=<verb>[.<chan>] <params>". The firmware appends a
+# channel qualifier to per-channel commands (e.g. "SZ.2"); "V" carries none. A
+# plain "=<verb> " prefix match would miss the qualified form and drop every
+# poll response. Group 1 is the verb (sans qualifier), group 2 the params.
+_RESP_RE = re.compile(r"=([A-Za-z]+)(?:\.\d+)?\s+(.*)")
 
 
 class PulseEightError(Exception):
@@ -95,8 +105,10 @@ class PulseEightClient:
     The switch keeps a connection open until the client closes it or 10 minutes
     elapse, and services only a small number of sockets. A persistent connection
     would leak a socket on any HA restart/crash and block reconnection for up to
-    10 minutes, so instead we open a fresh connection per command and close it
-    immediately. Commands are serialised by a lock.
+    10 minutes, so instead we open a fresh connection per command and force it
+    shut with a TCP RST as soon as we're done — a graceful FIN would leave the
+    switch's socket in CLOSE_WAIT, holding a pool slot until its 10-minute idle
+    timer. Commands are serialised by a lock.
     """
 
     def __init__(self, host: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> None:
@@ -113,11 +125,12 @@ class PulseEightClient:
     async def async_close(self) -> None:
         """Abort any in-flight command's socket so the switch frees it now.
 
-        Per-command connections normally close themselves. But if a command is
-        still running when the entry is torn down (e.g. a poll in flight during a
-        HACS reload), its socket would linger on the switch — which services only
-        a few sockets and holds them ~10 minutes — and starve the reconnect. An
-        immediate abort (RST) tells the switch the socket is gone right away.
+        Per-command connections RST-close themselves on completion. But if a
+        command is still running when the entry is torn down (e.g. a poll in
+        flight during a HACS reload), its socket would linger on the switch —
+        which services only a few sockets and holds them ~10 minutes — and
+        starve the reconnect. An immediate abort (RST) tells the switch the
+        socket is gone right away.
         """
         writer = self._writer
         if writer is not None:
@@ -126,29 +139,16 @@ class PulseEightClient:
 
     # --- Low-level command exchange ---------------------------------------
 
-    async def _command(
-        self,
-        verb: str,
-        body: str = "",
-        expected: int = 1,
-        require_response: bool = True,
-    ) -> list[str]:
-        """Send ``^<verb> <body>$`` and return the params of matching ``^=`` frames.
+    @contextlib.asynccontextmanager
+    async def _open(self):
+        """Open a serialised, per-command connection and always RST-close it.
 
-        Opens a connection, runs the exchange, and closes it. Response handling
-        does NOT depend on the ``^+$`` ack (units can have ACK disabled): we read
-        the first frame within the connect timeout, then keep reading with a
-        short inter-frame gap, returning once ``expected`` data frames arrive or
-        the gap elapses. ``expected`` is how many ``^=<verb>`` frames to wait for
-        (1 for a set/version, ``outputs`` for a batch query).
-
-        A ``^!<n>$`` frame raises :class:`PulseEightCommandError`; other frames
-        (acks, async/echo frames for other commands) are skipped. With
-        ``require_response=False`` the command is fire-and-forget: any replies
-        are drained but total silence is not an error (used for XS config, which
-        may not reply until ACK/ECO are enabled).
+        Holds the command lock, tracks the writer so a teardown can abort it,
+        and on exit forces the socket shut with a TCP RST (``_abort_writer``)
+        rather than a graceful FIN: the switch's command-oriented socket would
+        otherwise sit in CLOSE_WAIT, holding one of its few pool slots until the
+        10-minute idle timer and eventually refusing new connections.
         """
-        sent = f"^{verb} {body}$" if body else f"^{verb}$"
         async with self._lock:
             _LOGGER.debug("Connecting to %s:%s", self._host, self._port)
             try:
@@ -162,9 +162,41 @@ class PulseEightClient:
                 ) from err
             self._writer = writer
             try:
-                return await self._exchange(
-                    reader, writer, verb, body, expected, require_response
+                yield reader, writer
+            finally:
+                self._writer = None
+                _abort_writer(writer)
+
+    async def _command(
+        self,
+        verb: str,
+        body: str = "",
+        expected: int = 1,
+        require_response: bool = True,
+    ) -> list[str]:
+        """Send ``^<verb> <body>$`` and return the params of matching ``^=`` frames.
+
+        Response handling does NOT depend on the ``^+$`` ack (units can have ACK
+        disabled): we read the first frame within the connect timeout, then keep
+        reading with a short inter-frame gap, returning once ``expected`` data
+        frames arrive or the gap elapses. ``expected`` is how many ``^=<verb>``
+        frames to wait for (1 for a set/version).
+
+        A ``^!<n>$`` frame raises :class:`PulseEightCommandError`; acks and
+        frames for other verbs are skipped. With ``require_response=False`` the
+        command is fire-and-forget: any reply is drained but total silence is not
+        an error (used for XS config, which may not reply until ACK/ECO are on).
+        """
+        sent = f"^{verb} {body}$" if body else f"^{verb}$"
+        async with self._open() as (reader, writer):
+            try:
+                _LOGGER.debug("TX %s", sent)
+                writer.write(sent.encode("ascii"))
+                await writer.drain()
+                frames = await self._read_frames(
+                    reader, {verb}, expected, require_response
                 )
+                return frames[verb]
             except asyncio.TimeoutError as err:
                 raise PulseEightConnectionError(
                     f"No response from {self._host}:{self._port} to {sent!r} "
@@ -176,41 +208,64 @@ class PulseEightClient:
                     f"Communication error with {self._host}:{self._port} on "
                     f"{sent!r}: {err!r}"
                 ) from err
-            finally:
-                self._writer = None
-                writer.close()
-                # wait_closed() confirms the graceful FIN, but re-raises if we're
-                # here because the task was cancelled (reload/shutdown). Shield it
-                # so the close still completes; the close itself is already
-                # scheduled by writer.close() regardless.
-                try:
-                    await asyncio.shield(writer.wait_closed())
-                except (OSError, asyncio.CancelledError):
-                    pass
 
-    async def _exchange(
+    async def _command_many(
+        self, commands: list[tuple[str, str]], expected_per: int
+    ) -> dict[str, list[str]]:
+        """Run several queries over ONE connection; return params keyed by verb.
+
+        The switch buffers commands until each ``$`` and executes them in order,
+        returning all responses on the same socket, so batching the poll's
+        queries into a single connection cuts socket churn against the switch's
+        tiny pool. ``commands`` must use distinct verbs; ``expected_per`` is the
+        number of ``^=`` frames expected from each.
+        """
+        payload = "".join(
+            f"^{verb} {body}$" if body else f"^{verb}$" for verb, body in commands
+        )
+        verbs = {verb for verb, _ in commands}
+        total = expected_per * len(commands)
+        async with self._open() as (reader, writer):
+            try:
+                _LOGGER.debug("TX %s", payload)
+                writer.write(payload.encode("ascii"))
+                await writer.drain()
+                return await self._read_frames(
+                    reader, verbs, total, require_response=True
+                )
+            except asyncio.TimeoutError as err:
+                raise PulseEightConnectionError(
+                    f"No response from {self._host}:{self._port} to batch poll "
+                    f"{payload!r} within {self._timeout}s"
+                ) from err
+            except OSError as err:
+                raise PulseEightConnectionError(
+                    f"Communication error with {self._host}:{self._port} on "
+                    f"batch poll {payload!r}: {err!r}"
+                ) from err
+
+    async def _read_frames(
         self,
         reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        verb: str,
-        body: str,
+        verbs: set[str],
         expected: int,
         require_response: bool,
-    ) -> list[str]:
-        command = f"^{verb} {body}$" if body else f"^{verb}$"
-        _LOGGER.debug("TX %s", command)
-        writer.write(command.encode("ascii"))
-        await writer.drain()
+    ) -> dict[str, list[str]]:
+        """Read ``^...$`` frames, bucketing ``^=<verb>`` params by verb.
 
-        prefix = f"={verb} "
+        Stops once ``expected`` data frames have been collected (across all
+        ``verbs``) or the inter-frame gap elapses. The full connect timeout
+        applies only while awaiting the first frame of a response we require, so
+        an ACK-off unit — or a fire-and-forget command that sends nothing —
+        returns promptly. A ``^!<n>$`` frame raises; ``^+$`` acks and frames for
+        other verbs are skipped. ``_RESP_RE`` tolerates the firmware's channel
+        qualifier (``SZ.2``), which a plain prefix match would miss.
+        """
+        results: dict[str, list[str]] = {verb: [] for verb in verbs}
         buffer = bytearray()
-        results: list[str] = []
+        collected = 0
         first = True
-        while expected <= 0 or len(results) < expected:
-            # Full timeout only while awaiting the first frame of a command we
-            # require a reply to (detects a dead link); a short gap otherwise, so
-            # an ACK-off unit that sends only its data frame — or a fire-and-
-            # forget command that sends nothing — returns promptly.
+        while expected <= 0 or collected < expected:
             timeout = (
                 self._timeout
                 if first and require_response
@@ -222,23 +277,33 @@ class PulseEightClient:
                 )
             except asyncio.TimeoutError:
                 if first and require_response:
-                    _LOGGER.debug("RX timeout (no response) for %s", command)
+                    _LOGGER.debug("RX timeout (no response)")
                     raise
                 # Fire-and-forget, or no more frames coming: we're done.
                 break
             first = False
             _LOGGER.debug("RX ^%s$", frame)
-            self._collect_frame(frame, prefix, results)
+            matched = self._match_frame(frame, verbs)
+            if matched is not None:
+                verb, params = matched
+                results[verb].append(params)
+                collected += 1
         return results
 
     @staticmethod
-    def _collect_frame(frame: str, prefix: str, results: list[str]) -> None:
-        """Classify one frame: append data, raise on error, skip the rest."""
+    def _match_frame(frame: str, verbs: set[str]) -> tuple[str, str] | None:
+        """Classify one frame: (verb, params) if wanted, else None to skip.
+
+        Raises :class:`PulseEightCommandError` on a ``!<n>`` error frame. ``+``
+        acks and ``=`` frames for other verbs return None. ``_RESP_RE`` strips
+        the firmware's channel qualifier (``SZ.2`` -> ``SZ``) before matching.
+        """
         if frame.startswith("!"):
             raise PulseEightCommandError(int(frame[1:] or 0))
-        if frame.startswith(prefix):
-            results.append(frame[len(prefix):])
-        # "+" acks and async/echo frames for other commands are ignored.
+        match = _RESP_RE.match(frame)
+        if match and match.group(1) in verbs:
+            return match.group(1), match.group(2)
+        return None
 
     @staticmethod
     async def _read_frame(reader: asyncio.StreamReader, buffer: bytearray) -> str:
@@ -297,21 +362,24 @@ class PulseEightClient:
         await self._command("XS", f"-{XS_ASY_FLAG}", require_response=False)
 
     async def async_get_state(self, outputs: int) -> MatrixState:
-        """Poll routing, mute and volume for zones 1..outputs."""
+        """Poll routing, mute and volume for zones 1..outputs in one exchange."""
         state = MatrixState()
         if outputs < 1:
             return state
         zones = "".join(f"@{z}" for z in range(1, outputs + 1))
-
-        for raw in await self._command("SZ", f"{zones},?", expected=outputs):
+        frames = await self._command_many(
+            [("SZ", f"{zones},?"), ("VMZ", f"{zones},?"), ("VPZ", f"{zones},?")],
+            expected_per=outputs,
+        )
+        for raw in frames.get("SZ", []):
             zone, source = _parse_pair(raw)
             if zone is not None:
                 state.routes[zone] = source
-        for raw in await self._command("VMZ", f"{zones},?", expected=outputs):
+        for raw in frames.get("VMZ", []):
             zone, mute = _parse_pair(raw)
             if zone is not None:
                 state.mutes[zone] = bool(mute)
-        for raw in await self._command("VPZ", f"{zones},?", expected=outputs):
+        for raw in frames.get("VPZ", []):
             zone, vol = _parse_pair(raw)
             if zone is not None:
                 state.volumes[zone] = vol
