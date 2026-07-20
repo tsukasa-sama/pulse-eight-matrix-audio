@@ -95,8 +95,11 @@ VOLUME_MAX: Final = 100
 SOURCE_OFF_LABEL: Final = "Off"
 # Fade-in time when selecting a source, via the 'VMZ' mute fade ('VMLZ'/'VMT').
 FADE_SECONDS: Final = 3
-# 'VMT' time mode counts 100 ms steps (10 = 1 s), range 1-100.
+# 'VMT' takes two values: a time (timed mode, 100 ms steps: 10 = 1 s, 1-100)
+# and a slope (sloped mode, 1-255). We drive timed mode via VMLZ, so the time
+# sets the fade duration and the slope stays at its default.
 VMT_FADE_STEPS: Final = FADE_SECONDS * 10
+VMT_SLOPE_DEFAULT: Final = 160
 # 'VMLZ' full-depth mute in timed mode (10000 + 248) so unmute fades all the way.
 VMLZ_TIMED_FULL_MUTE: Final = 10248
 

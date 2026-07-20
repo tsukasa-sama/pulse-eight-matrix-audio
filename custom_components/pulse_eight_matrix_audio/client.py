@@ -29,6 +29,7 @@ from .const import (
     DEFAULT_TIMEOUT,
     VMLZ_TIMED_FULL_MUTE,
     VMT_FADE_STEPS,
+    VMT_SLOPE_DEFAULT,
     XS_ACK_FLAG,
     XS_ASY_FLAG,
     XS_ECO_FLAG,
@@ -124,6 +125,9 @@ class PulseEightClient:
         # teardown (async_close) can force it shut instead of leaving a half-open
         # socket the switch will hold for up to 10 minutes.
         self._writer: asyncio.StreamWriter | None = None
+        # Zones whose per-zone mute-fade (VMLZ/VMT) we've configured this
+        # session; the switch retains the setting, so we send it once per zone.
+        self._fade_configured: set[int] = set()
 
     async def async_close(self) -> None:
         """Abort any in-flight command's socket so the switch frees it now.
@@ -247,13 +251,16 @@ class PulseEightClient:
                     f"batch poll {payload!r}: {err!r}"
                 ) from err
 
-    async def _send(self, commands: list[tuple[str, str]]) -> None:
+    async def _send(
+        self, commands: list[tuple[str, str]], raise_on_error: bool = True
+    ) -> None:
         """Fire a batch of set commands over ONE connection; drain any replies.
 
         The switch buffers commands until each ``$`` and executes them in the
-        order given, so callers can sequence e.g. route -> fade-config -> unmute
-        atomically on a single socket. A ``^!<n>$`` error is raised; acks and
-        echo frames are drained (no reply is required).
+        order given, so callers can sequence e.g. route -> unmute atomically on a
+        single socket. With ``raise_on_error`` (default) a ``^!<n>$`` reply
+        raises; pass False for best-effort config the switch may reject without
+        failing the whole action. Acks and echo frames are drained.
         """
         payload = "".join(
             f"^{verb} {body}$" if body else f"^{verb}$" for verb, body in commands
@@ -265,9 +272,10 @@ class PulseEightClient:
                 writer.write(payload.encode("ascii"))
                 await writer.drain()
                 # expected=0 + require_response=False: read/drain until the
-                # inter-frame gap, surfacing any error frame, then return.
+                # inter-frame gap, then return.
                 await self._read_frames(
-                    reader, verbs, expected=0, require_response=False
+                    reader, verbs, expected=0, require_response=False,
+                    raise_on_error=raise_on_error,
                 )
             except OSError as err:
                 raise PulseEightConnectionError(
@@ -281,6 +289,7 @@ class PulseEightClient:
         verbs: set[str],
         expected: int,
         require_response: bool,
+        raise_on_error: bool = True,
     ) -> dict[str, list[str]]:
         """Read ``^...$`` frames, bucketing ``^=<verb>`` params by verb.
 
@@ -288,9 +297,10 @@ class PulseEightClient:
         ``verbs``) or the inter-frame gap elapses. The full connect timeout
         applies only while awaiting the first frame of a response we require, so
         an ACK-off unit — or a fire-and-forget command that sends nothing —
-        returns promptly. A ``^!<n>$`` frame raises; ``^+$`` acks and frames for
-        other verbs are skipped. ``_RESP_RE`` tolerates the firmware's channel
-        qualifier (``SZ.2``), which a plain prefix match would miss.
+        returns promptly. A ``^!<n>$`` frame raises when ``raise_on_error``,
+        else it is logged and skipped; ``^+$`` acks and frames for other verbs
+        are skipped. ``_RESP_RE`` tolerates the firmware's channel qualifier
+        (``SZ.2``), which a plain prefix match would miss.
         """
         results: dict[str, list[str]] = {verb: [] for verb in verbs}
         buffer = bytearray()
@@ -314,27 +324,38 @@ class PulseEightClient:
                 break
             first = False
             _LOGGER.debug("RX ^%s$", frame)
-            matched = self._match_frame(frame, verbs)
-            if matched is not None:
-                verb, params = matched
-                results[verb].append(params)
+            if self._handle_frame(frame, verbs, results, raise_on_error):
                 collected += 1
         return results
 
     @staticmethod
-    def _match_frame(frame: str, verbs: set[str]) -> tuple[str, str] | None:
-        """Classify one frame: (verb, params) if wanted, else None to skip.
+    def _handle_frame(
+        frame: str,
+        verbs: set[str],
+        results: dict[str, list[str]],
+        raise_on_error: bool,
+    ) -> bool:
+        """Route one frame into ``results``; return True if a data frame was kept.
 
-        Raises :class:`PulseEightCommandError` on a ``!<n>`` error frame. ``+``
-        acks and ``=`` frames for other verbs return None. ``_RESP_RE`` strips
-        the firmware's channel qualifier (``SZ.2`` -> ``SZ``) before matching.
+        A ``^!<n>$`` frame raises when ``raise_on_error`` else is logged and
+        dropped. ``^=<verb>$`` frames for a wanted verb are appended (channel
+        qualifier ``SZ.2`` stripped by ``_RESP_RE``); ``+`` acks and frames for
+        other verbs are ignored.
         """
         if frame.startswith("!"):
-            raise PulseEightCommandError(int(frame[1:] or 0))
+            code = int(frame[1:] or 0)
+            if raise_on_error:
+                raise PulseEightCommandError(code)
+            _LOGGER.warning(
+                "Switch rejected a command: error %d (%s)",
+                code, _ERROR_TEXT.get(code, "unknown error"),
+            )
+            return False
         match = _RESP_RE.match(frame)
         if match and match.group(1) in verbs:
-            return match.group(1), match.group(2)
-        return None
+            results[match.group(1)].append(match.group(2))
+            return True
+        return False
 
     @staticmethod
     async def _read_frame(reader: asyncio.StreamReader, buffer: bytearray) -> str:
@@ -448,21 +469,36 @@ class PulseEightClient:
         )
 
     async def async_route_and_fade_in(self, output: int, source: int) -> None:
-        """Route ``source`` to a zone and fade audio in over ``FADE_SECONDS``.
+        """Route ``source`` to a zone and fade audio in to its set volume.
 
-        One exchange, executed in order: route the source, set a full-depth
-        timed mute level ('VMLZ') and the fade time ('VMT'), then unmute ('VMZ
-        @zone,0') so the audio fades up to the zone's current volume. If the
-        zone was already unmuted, the unmute is a no-op and it simply switches.
+        The per-zone fade depth+time ('VMLZ'/'VMT') is configured once per
+        session (best-effort — a unit that rejects it just uses its default fade
+        timing). The essential step then routes the source and unmutes ('VMZ
+        @zone,0'), fading up from the muted level. If the zone was already
+        unmuted the unmute is a no-op and it simply switches source.
         """
         _LOGGER.debug("Route+fade zone %d -> source %d", output, source)
+        if output not in self._fade_configured:
+            self._fade_configured.add(output)
+            await self._configure_fade(output)
+        await self._send([("SZ", f"@{output},{source}"), ("VMZ", f"@{output},0")])
+
+    async def _configure_fade(self, output: int) -> None:
+        """Best-effort per-zone mute-fade setup for the source-select fade-in.
+
+        Sends 'VMLZ' (full-depth timed mute) then 'VMT' (fade time) as separate
+        best-effort commands, so a rejection is logged per-command (paired with
+        its ``TX`` line) without failing source-select. The switch retains these
+        settings, so this runs once per zone per session.
+        """
         await self._send(
-            [
-                ("SZ", f"@{output},{source}"),
-                ("VMLZ", f"@{output},{VMLZ_TIMED_FULL_MUTE}"),
-                ("VMT", f"@{output},{VMT_FADE_STEPS}"),
-                ("VMZ", f"@{output},0"),
-            ]
+            [("VMLZ", f"@{output},{VMLZ_TIMED_FULL_MUTE}")], raise_on_error=False
+        )
+        # 'VMT' takes two values (time, slope); we set the fade time and leave
+        # slope at its default. See the const notes on parameter order.
+        await self._send(
+            [("VMT", f"@{output},{VMT_FADE_STEPS},{VMT_SLOPE_DEFAULT}")],
+            raise_on_error=False,
         )
 
 
