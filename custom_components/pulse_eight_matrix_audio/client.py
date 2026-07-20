@@ -27,10 +27,13 @@ from dataclasses import dataclass, field
 
 from .const import (
     DEFAULT_TIMEOUT,
+    VMLZ_TIMED_FULL_MUTE,
+    VMT_FADE_STEPS,
     XS_ACK_FLAG,
     XS_ASY_FLAG,
     XS_ECO_FLAG,
     XS_EXTENDED_IO_FLAG,
+    XS_UVL_FLAG,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -244,6 +247,34 @@ class PulseEightClient:
                     f"batch poll {payload!r}: {err!r}"
                 ) from err
 
+    async def _send(self, commands: list[tuple[str, str]]) -> None:
+        """Fire a batch of set commands over ONE connection; drain any replies.
+
+        The switch buffers commands until each ``$`` and executes them in the
+        order given, so callers can sequence e.g. route -> fade-config -> unmute
+        atomically on a single socket. A ``^!<n>$`` error is raised; acks and
+        echo frames are drained (no reply is required).
+        """
+        payload = "".join(
+            f"^{verb} {body}$" if body else f"^{verb}$" for verb, body in commands
+        )
+        verbs = {verb for verb, _ in commands}
+        async with self._open() as (reader, writer):
+            try:
+                _LOGGER.debug("TX %s", payload)
+                writer.write(payload.encode("ascii"))
+                await writer.drain()
+                # expected=0 + require_response=False: read/drain until the
+                # inter-frame gap, surfacing any error frame, then return.
+                await self._read_frames(
+                    reader, verbs, expected=0, require_response=False
+                )
+            except OSError as err:
+                raise PulseEightConnectionError(
+                    f"Communication error with {self._host}:{self._port} on "
+                    f"{payload!r}: {err!r}"
+                ) from err
+
     async def _read_frames(
         self,
         reader: asyncio.StreamReader,
@@ -346,20 +377,24 @@ class PulseEightClient:
         """Normalise the XS control flags for predictable behaviour.
 
         Turns ACK and ECO on (so replies are deterministic) and ASY off (no
-        unsolicited frames to desync the reader), and optionally sets XIO for
-        model-independent source numbering. Fire-and-forget: these run before we
-        know the current ACK state, so a missing reply is not an error.
+        unsolicited frames to desync the reader), optionally sets XIO for
+        model-independent source numbering, and clears UVL (settings2) so a
+        direct volume set doesn't unmute — letting a muted/off zone stage its
+        volume for the source-select fade-in. Fire-and-forget: these run before
+        we know the current ACK state, so a missing reply is not an error.
         """
         set_bits = XS_ACK_FLAG | XS_ECO_FLAG
         if extended_io:
             set_bits |= XS_EXTENDED_IO_FLAG
         _LOGGER.debug(
-            "Configuring XS: set +%d (ACK/ECO%s), clear -%d (ASY)",
+            "Configuring XS: set +%d (ACK/ECO%s), clear -%d (ASY), clear UVL",
             set_bits, "/XIO" if extended_io else "", XS_ASY_FLAG,
         )
         # '+' sets the listed bits, '-' clears them, without touching the rest.
         await self._command("XS", f"+{set_bits}", require_response=False)
         await self._command("XS", f"-{XS_ASY_FLAG}", require_response=False)
+        # A leading comma targets settings2 only; '-' clears the UVL bit there.
+        await self._command("XS", f",-{XS_UVL_FLAG}", require_response=False)
 
     async def async_get_state(self, outputs: int) -> MatrixState:
         """Poll routing, mute and volume for zones 1..outputs in one exchange."""
@@ -399,6 +434,36 @@ class PulseEightClient:
         """Set output volume as a 0-100 percentage ('VPZ')."""
         _LOGGER.debug("Set volume: zone %d -> %d%%", output, volume)
         await self._command("VPZ", f"@{output},{volume}")
+
+    async def async_disconnect(self, output: int) -> None:
+        """Disconnect a zone: hard-cut the route and mute it, in one exchange.
+
+        ``SZ @<zone>,0`` drops the source immediately (instant silence, and the
+        zone reads as not-playing); ``VMZ @<zone>,1`` also mutes it so a later
+        source-select can fade back in from the muted level.
+        """
+        _LOGGER.debug("Disconnect zone %d", output)
+        await self._send(
+            [("SZ", f"@{output},0"), ("VMZ", f"@{output},1")]
+        )
+
+    async def async_route_and_fade_in(self, output: int, source: int) -> None:
+        """Route ``source`` to a zone and fade audio in over ``FADE_SECONDS``.
+
+        One exchange, executed in order: route the source, set a full-depth
+        timed mute level ('VMLZ') and the fade time ('VMT'), then unmute ('VMZ
+        @zone,0') so the audio fades up to the zone's current volume. If the
+        zone was already unmuted, the unmute is a no-op and it simply switches.
+        """
+        _LOGGER.debug("Route+fade zone %d -> source %d", output, source)
+        await self._send(
+            [
+                ("SZ", f"@{output},{source}"),
+                ("VMLZ", f"@{output},{VMLZ_TIMED_FULL_MUTE}"),
+                ("VMT", f"@{output},{VMT_FADE_STEPS}"),
+                ("VMZ", f"@{output},0"),
+            ]
+        )
 
 
 def _abort_writer(writer: asyncio.StreamWriter) -> None:

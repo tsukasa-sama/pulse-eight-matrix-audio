@@ -9,11 +9,11 @@ from homeassistant.components.media_player import (
     MediaPlayerEntityFeature,
     MediaPlayerState,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import PulseEightConfigEntry
-from .const import VOLUME_MAX
+from .const import SOURCE_OFF_LABEL, VOLUME_MAX
 from .coordinator import PulseEightCoordinator
 from .entity import PulseEightEntity
 
@@ -41,6 +41,8 @@ class PulseEightZone(PulseEightEntity, MediaPlayerEntity):
         MediaPlayerEntityFeature.SELECT_SOURCE
         | MediaPlayerEntityFeature.VOLUME_SET
         | MediaPlayerEntityFeature.VOLUME_MUTE
+        | MediaPlayerEntityFeature.TURN_ON
+        | MediaPlayerEntityFeature.TURN_OFF
     )
 
     def __init__(self, coordinator: PulseEightCoordinator, output: int) -> None:
@@ -48,13 +50,24 @@ class PulseEightZone(PulseEightEntity, MediaPlayerEntity):
         self._output = output
         self._attr_unique_id = f"{coordinator.entry.entry_id}_zone_{output}"
         self._attr_translation_placeholders = {"output": str(output)}
-        self._attr_source_list = coordinator.source_names()
+        # "Off" (disconnect) leads the list, then the enabled inputs.
+        self._attr_source_list = [SOURCE_OFF_LABEL, *coordinator.source_names()]
+        # Last real (non-disconnected) source, so turn-on can restore it.
+        self._last_source: int | None = None
         # Optimistic fallbacks: reflect a just-issued command immediately, and
         # keep showing it if the switch's read-back is unavailable. Poll data,
         # when present, always takes precedence.
         self._optimistic_route: int | None = None
         self._optimistic_mute: bool | None = None
         self._optimistic_volume: int | None = None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Track the last real source seen, so turn-on can restore it."""
+        route = self.coordinator.data.routes.get(self._output)
+        if route:  # >0: a real source (0 = disconnected)
+            self._last_source = route
+        super()._handle_coordinator_update()
 
     # --- current values (poll data first, then optimistic) -----------------
 
@@ -72,14 +85,18 @@ class PulseEightZone(PulseEightEntity, MediaPlayerEntity):
 
     @property
     def state(self) -> MediaPlayerState:
-        """PLAYING once a real source is routed, otherwise IDLE."""
-        return MediaPlayerState.PLAYING if self.source else MediaPlayerState.IDLE
+        """PLAYING once a real source is routed, otherwise OFF (disconnected)."""
+        return MediaPlayerState.PLAYING if self._route() else MediaPlayerState.OFF
 
     @property
     def source(self) -> str | None:
-        """Currently routed input name (None when disconnected)."""
+        """Routed input name; the Off label when disconnected; None if unknown."""
         number = self._route()
-        return self.coordinator.name_for_number(number) if number else None
+        if number:
+            return self.coordinator.name_for_number(number)
+        if number == 0:
+            return SOURCE_OFF_LABEL
+        return None
 
     @property
     def media_title(self) -> str | None:
@@ -98,7 +115,10 @@ class PulseEightZone(PulseEightEntity, MediaPlayerEntity):
         return vol / VOLUME_MAX if vol is not None else None
 
     async def async_select_source(self, source: str) -> None:
-        """Route an input to this zone."""
+        """Route an input to this zone (fading in), or disconnect if 'Off'."""
+        if source == SOURCE_OFF_LABEL:
+            await self.async_turn_off()
+            return
         number = self.coordinator.number_for_name(source)
         _LOGGER.debug(
             "zone %d select source %r (source number %s)",
@@ -110,9 +130,34 @@ class PulseEightZone(PulseEightEntity, MediaPlayerEntity):
                 self._output, source, self._attr_source_list,
             )
             return
-        self._optimistic_route = number
+        await self._route_and_fade_in(number)
+
+    async def async_turn_on(self) -> None:
+        """Reconnect the last-used source and fade it in."""
+        if self._last_source is None:
+            _LOGGER.debug(
+                "zone %d turn_on: no previous source to restore", self._output
+            )
+            return
+        _LOGGER.debug("zone %d turn_on -> source %d", self._output, self._last_source)
+        await self._route_and_fade_in(self._last_source)
+
+    async def async_turn_off(self) -> None:
+        """Disconnect this zone: hard-cut the source and mute it."""
+        _LOGGER.debug("zone %d turn_off (disconnect)", self._output)
+        self._optimistic_route = 0
+        self._optimistic_mute = True
         self.async_write_ha_state()
-        await self.coordinator.client.async_set_route(self._output, number)
+        await self.coordinator.client.async_disconnect(self._output)
+        await self.coordinator.async_request_refresh()
+
+    async def _route_and_fade_in(self, number: int) -> None:
+        """Route ``number`` to this zone, unmute, and fade in over 3 s."""
+        self._last_source = number
+        self._optimistic_route = number
+        self._optimistic_mute = False
+        self.async_write_ha_state()
+        await self.coordinator.client.async_route_and_fade_in(self._output, number)
         await self.coordinator.async_request_refresh()
 
     async def async_mute_volume(self, mute: bool) -> None:

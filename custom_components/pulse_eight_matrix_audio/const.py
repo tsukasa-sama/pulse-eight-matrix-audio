@@ -45,6 +45,10 @@ XS_EXTENDED_IO_FLAG: Final = 32768
 XS_ASY_FLAG: Final = 1  # async unsolicited responses (we turn OFF)
 XS_ACK_FLAG: Final = 2  # "^+$" acknowledgements (we turn ON)
 XS_ECO_FLAG: Final = 4  # echo "^=...$" on set commands (we turn ON)
+# 'settings2' bit: UVL (value 4). When set, a direct 'VPZ'/'VZ' unmutes the
+# zone. We clear it so the volume slider can stage a level on a muted/off zone
+# without unmuting, letting source-select fade in to that level.
+XS_UVL_FLAG: Final = 4
 SOURCE_DISCONNECT: Final = 0
 SOURCE_BASE: Final[dict[str, int]] = {
     KIND_ANALOG: 0,
@@ -85,6 +89,16 @@ DEFAULT_EXTENDED_IO: Final = True
 # 'VPZ' sets/reads volume as a 0-100 percentage; 0 is full mute.
 VOLUME_MIN: Final = 0
 VOLUME_MAX: Final = 100
+
+# --- Disconnect / fade-in --------------------------------------------------
+# Source-list entry that disconnects a zone (also the label shown while Off).
+SOURCE_OFF_LABEL: Final = "Off"
+# Fade-in time when selecting a source, via the 'VMZ' mute fade ('VMLZ'/'VMT').
+FADE_SECONDS: Final = 3
+# 'VMT' time mode counts 100 ms steps (10 = 1 s), range 1-100.
+VMT_FADE_STEPS: Final = FADE_SECONDS * 10
+# 'VMLZ' full-depth mute in timed mode (10000 + 248) so unmute fades all the way.
+VMLZ_TIMED_FULL_MUTE: Final = 10248
 
 # --- Coordinator -----------------------------------------------------------
 SCAN_INTERVAL_SECONDS: Final = 30
